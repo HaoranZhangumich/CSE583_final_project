@@ -1,1 +1,4 @@
 .DS_Store
+data/case-study-a/models/
+data/case-study-a/*.tar.bz2
+data/case-study-b/our-models-*
