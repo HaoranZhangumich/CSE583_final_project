@@ -39,6 +39,28 @@ def _load_program_text(src: str, cache_dir: Path, input_mode: str) -> str:
         return load_ir_for_source(src, cache_dir)
     raise ValueError(f"Unsupported input_mode: {input_mode}")
 
+def _should_keep_source_for_fair_comparison(
+    src: str,
+    cache_dir: Path,
+    input_mode: str,
+) -> bool:
+    # For IR mode, obviously require compiled IR.
+    # For source mode, also require compiled IR so source/IR use the same subset.
+    return has_ir_for_source(src, cache_dir)
+
+
+def _get_text_by_mode(
+    src: str,
+    cache_dir: Path,
+    input_mode: str,
+) -> str:
+    if input_mode == "ir":
+        return load_ir_for_source(src, cache_dir)
+    elif input_mode == "source":
+        return src
+    else:
+        raise ValueError(f"Unsupported input_mode: {input_mode}")
+
 
 def prepare_device_mapping_inputs(
     repo_root: Path,
@@ -46,6 +68,7 @@ def prepare_device_mapping_inputs(
     tokenizer,
     platform: str,
     cfg: TrainConfig,
+    input_mode: str,
 ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray]:
     if isinstance(tokenizer, (str, Path)):
         tokenizer = load_tokenizer(Path(tokenizer))
@@ -55,22 +78,24 @@ def prepare_device_mapping_inputs(
     kept_rows: List[int] = []
     sequences = []
     labels = []
+
     skipped = 0
 
     for i, row in tqdm(
         df.iterrows(),
         total=len(df),
-        desc=f"Encoding {cfg.input_mode} ({platform})",
+        desc=f"Encoding {input_mode} ({platform})",
     ):
         src = str(row["src"])
 
-        if not _has_input_for_source(src, cache_dir, cfg.input_mode):
+        # IMPORTANT: source mode also matches the IR-valid subset
+        if not _should_keep_source_for_fair_comparison(src, cache_dir, input_mode):
             skipped += 1
             continue
 
-        program_text = _load_program_text(src, cache_dir, cfg.input_mode)
+        text = _get_text_by_mode(src, cache_dir, input_mode)
         sequences.append(
-            encode_program_text(tokenizer, program_text, cfg.max_stmt_len, cfg.max_program_len)
+            encode_program_text(tokenizer, text, cfg.max_stmt_len, cfg.max_program_len)
         )
         labels.append(DEVICE_LABEL_TO_ID[str(row["oracle"])])
         kept_rows.append(i)
@@ -80,16 +105,16 @@ def prepare_device_mapping_inputs(
     sequences = np.asarray(sequences, dtype=np.int64)
 
     print(
-        f"[device-mapping:{platform}:{cfg.input_mode}] kept {len(filtered_df)} "
-        f"samples, skipped {skipped} unavailable samples."
+        f"[device-mapping:{platform}:{input_mode}] kept {len(filtered_df)} samples, skipped {skipped} invalid samples."
     )
-    print(f"[device-mapping:{platform}] label counts after filtering: {np.bincount(labels).tolist()}")
+    print(
+        f"[device-mapping:{platform}:{input_mode}] label counts after filtering: {np.bincount(labels).tolist()}"
+    )
 
     if len(filtered_df) == 0:
-        raise RuntimeError(f"No valid samples left for platform={platform}.")
+        raise RuntimeError(f"No valid samples left for platform={platform}, input_mode={input_mode}.")
 
     return filtered_df, sequences, labels
-
 
 def clamp_cf_to_available(pred_cf: int, available_cfs: Sequence[int]) -> int:
     available_sorted = sorted(set(int(x) for x in available_cfs))
@@ -102,6 +127,7 @@ def prepare_thread_coarsening_inputs(
     cache_dir: Path,
     tokenizer,
     cfg: TrainConfig,
+    input_mode: str,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, List[str], np.ndarray]:
     if isinstance(tokenizer, (str, Path)):
         tokenizer = load_tokenizer(Path(tokenizer))
@@ -114,20 +140,21 @@ def prepare_thread_coarsening_inputs(
         rows = runtimes[runtimes["kernel"] == kernel]
         kernel_to_src[kernel] = str(rows.iloc[0]["src"])
 
-    kept_kernels: List[str] = []
+    kept_kernels = []
     sequences = []
     skipped = 0
 
-    for kernel in tqdm(kernels, desc=f"Encoding {cfg.input_mode} (thread coarsening)"):
+    for kernel in tqdm(kernels, desc=f"Encoding {input_mode} (thread coarsening)"):
         src = kernel_to_src[kernel]
 
-        if not _has_input_for_source(src, cache_dir, cfg.input_mode):
+        # IMPORTANT: source mode also matches the IR-valid subset
+        if not _should_keep_source_for_fair_comparison(src, cache_dir, input_mode):
             skipped += 1
             continue
 
-        program_text = _load_program_text(src, cache_dir, cfg.input_mode)
+        text = _get_text_by_mode(src, cache_dir, input_mode)
         sequences.append(
-            encode_program_text(tokenizer, program_text, cfg.max_stmt_len, cfg.max_program_len)
+            encode_program_text(tokenizer, text, cfg.max_stmt_len, cfg.max_program_len)
         )
         kept_kernels.append(kernel)
 
@@ -136,15 +163,13 @@ def prepare_thread_coarsening_inputs(
     filtered_oracles = filtered_oracles.set_index("kernel").loc[kept_kernels].reset_index()
 
     print(
-        f"[thread-coarsening:{cfg.input_mode}] kept {len(kept_kernels)} kernels, "
-        f"skipped {skipped} unavailable samples."
+        f"[thread-coarsening:{input_mode}] kept {len(kept_kernels)} kernels, skipped {skipped} invalid samples."
     )
 
     if len(kept_kernels) == 0:
-        raise RuntimeError("No valid kernels left for thread coarsening.")
+        raise RuntimeError(f"No valid kernels left for thread coarsening, input_mode={input_mode}.")
 
     return filtered_runtimes, filtered_oracles, kept_kernels, np.asarray(sequences, dtype=np.int64)
-
 
 def _make_inner_train_val_split(
     train_idx: np.ndarray,
@@ -202,6 +227,8 @@ def run_device_mapping_cv(
     out_dir: Path,
     seed: int,
     cfg: TrainConfig,
+    input_mode: str,
+    model_type: str,
 ) -> pd.DataFrame:
     ensure_dir(out_dir)
 
@@ -213,7 +240,7 @@ def run_device_mapping_cv(
 
     for platform in ["amd", "nvidia"]:
         df, sequences, labels = prepare_device_mapping_inputs(
-            repo_root, cache_dir, tokenizer, platform, cfg
+            repo_root, cache_dir, tokenizer, platform, cfg, input_mode=input_mode
         )
 
         class_counts = np.bincount(labels)
@@ -227,10 +254,7 @@ def run_device_mapping_cv(
             )
 
         kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-        print(
-            f"[device-mapping:{platform}:{cfg.input_mode}:{cfg.model_type}] "
-            f"using {n_splits}-fold CV after filtering."
-        )
+        print(f"[device-mapping:{platform}:{input_mode}:{model_type}] using {n_splits}-fold CV after filtering.")
 
         for fold, (train_idx, test_idx) in enumerate(kf.split(sequences, labels)):
             inner_train_idx, val_idx = _make_inner_train_val_split(
@@ -252,22 +276,17 @@ def run_device_mapping_cv(
             )
             preds = predict(model, sequences[test_idx], cfg)
 
-            print(
-                f"[device-mapping:{platform}] fold={fold} "
-                f"train_counts={np.bincount(labels[inner_train_idx], minlength=2).tolist()} "
-                f"val_counts={np.bincount(labels[val_idx], minlength=2).tolist()} "
-                f"test_counts={np.bincount(labels[test_idx], minlength=2).tolist()} "
-                f"pred_counts={np.bincount(preds, minlength=2).tolist()}"
-            )
-
             for row_idx, pred in zip(test_idx, preds):
                 runtime_cpu = float(df.iloc[row_idx]["runtime_cpu"])
                 runtime_gpu = float(df.iloc[row_idx]["runtime_gpu"])
                 baseline_runtime = runtime_cpu if platform == "amd" else runtime_gpu
                 pred_runtime = runtime_cpu if pred == 0 else runtime_gpu
+
                 rows.append(
                     {
                         "task": "device_mapping",
+                        "input_mode": input_mode,
+                        "model_type": model_type,
                         "platform": platform,
                         "fold": fold,
                         "benchmark": df.iloc[row_idx]["benchmark"],
@@ -277,14 +296,11 @@ def run_device_mapping_cv(
                         "pred_name": DEVICE_ID_TO_LABEL[int(pred)],
                         "correct": int(pred == labels[row_idx]),
                         "speedup_vs_default": baseline_runtime / pred_runtime if pred_runtime > 0 else np.nan,
-                        "input_mode": cfg.input_mode,
-                        "model_type": cfg.model_type,
                     }
                 )
 
     result_df = pd.DataFrame(rows)
-    result_path = out_dir / f"device_mapping_results_{cfg.input_mode}_{cfg.model_type}.csv"
-    result_df.to_csv(result_path, index=False)
+    result_df.to_csv(out_dir / f"device_mapping_results_{input_mode}_{model_type}.csv", index=False)
     return result_df
 
 
@@ -294,6 +310,8 @@ def run_thread_coarsening_cv(
     tokenizer_path: Path,
     out_dir: Path,
     cfg: TrainConfig,
+    input_mode: str,
+    model_type: str,
 ) -> pd.DataFrame:
     ensure_dir(out_dir)
 
@@ -302,7 +320,7 @@ def run_thread_coarsening_cv(
     pad_id = tokenizer.token_to_id("[PAD]")
 
     runtimes, oracles, kernels, sequences = prepare_thread_coarsening_inputs(
-        repo_root, cache_dir, tokenizer, cfg
+        repo_root, cache_dir, tokenizer, cfg, input_mode=input_mode
     )
 
     rows = []
@@ -331,6 +349,7 @@ def run_thread_coarsening_cv(
                 cfg=cfg,
                 use_class_weights=False,
             )
+
             pred_class = int(predict(model, sequences[test_idx], cfg)[0])
             pred_cf = CLASS_TO_CF[pred_class]
             kernel = kernels[int(test_idx[0])]
@@ -350,6 +369,8 @@ def run_thread_coarsening_cv(
             rows.append(
                 {
                     "task": "thread_coarsening",
+                    "input_mode": input_mode,
+                    "model_type": model_type,
                     "platform": platform,
                     "fold": fold,
                     "kernel": kernel,
@@ -358,27 +379,52 @@ def run_thread_coarsening_cv(
                     "correct": int(pred_cf == oracle_cf),
                     "speedup_vs_no_cf": no_cf_runtime / pred_runtime if pred_runtime > 0 else np.nan,
                     "oracle_fraction": oracle_runtime / pred_runtime if pred_runtime > 0 else np.nan,
-                    "input_mode": cfg.input_mode,
-                    "model_type": cfg.model_type,
                 }
             )
 
     result_df = pd.DataFrame(rows)
-    result_path = out_dir / f"thread_coarsening_results_{cfg.input_mode}_{cfg.model_type}.csv"
-    result_df.to_csv(result_path, index=False)
+    result_df.to_csv(out_dir / f"thread_coarsening_results_{input_mode}_{model_type}.csv", index=False)
     return result_df
-
 
 def summarize_results(out_dir: Path, cfg: TrainConfig) -> None:
     dm_path = out_dir / f"device_mapping_results_{cfg.input_mode}_{cfg.model_type}.csv"
     tc_path = out_dir / f"thread_coarsening_results_{cfg.input_mode}_{cfg.model_type}.csv"
 
+    txt_lines = [
+        f"input_mode: {cfg.input_mode}",
+        f"model_type: {cfg.model_type}",
+        "",
+    ]
+
     if dm_path.exists():
         dm = pd.read_csv(dm_path)
+        dm_summary = (
+            dm.groupby("platform")[["correct", "speedup_vs_default"]]
+            .mean()
+            .round(6)
+        )
         print("\n=== Device Mapping Summary ===")
-        print(dm.groupby("platform")[["correct", "speedup_vs_default"]].mean())
+        print(dm_summary)
+
+        txt_lines.append("=== Device Mapping Summary ===")
+        txt_lines.append(dm_summary.to_string())
+        txt_lines.append("")
 
     if tc_path.exists():
         tc = pd.read_csv(tc_path)
+        tc_summary = (
+            tc.groupby("platform")[["correct", "speedup_vs_no_cf", "oracle_fraction"]]
+            .mean()
+            .round(6)
+        )
         print("\n=== Thread Coarsening Summary ===")
-        print(tc.groupby("platform")[["correct", "speedup_vs_no_cf", "oracle_fraction"]].mean())
+        print(tc_summary)
+
+        txt_lines.append("=== Thread Coarsening Summary ===")
+        txt_lines.append(tc_summary.to_string())
+        txt_lines.append("")
+
+    txt_path = out_dir / f"summary_{cfg.input_mode}_{cfg.model_type}.txt"
+
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(txt_lines))
