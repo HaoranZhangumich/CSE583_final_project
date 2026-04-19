@@ -6,6 +6,7 @@ from typing import Dict, Sequence
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.nn.utils.rnn import pack_padded_sequence
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -56,10 +57,10 @@ class TransformerClassifier(nn.Module):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.norm = nn.LayerNorm(d_model)
         self.head = nn.Sequential(
-            nn.Linear(d_model, 32),
-            nn.ReLU(),
+            nn.Linear(d_model, 64),
+            nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(32, num_classes),
+            nn.Linear(64, num_classes),
         )
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -73,6 +74,66 @@ class TransformerClassifier(nn.Module):
         pooled = summed / denom
         pooled = self.norm(pooled)
         return self.head(pooled)
+
+
+class DeepTuneLSTMClassifier(nn.Module):
+    """
+    Approximate DeepTune-style classifier:
+    - embedding dim 64
+    - 2-layer LSTM hidden size 64
+    - batch normalization
+    - 32-unit MLP head
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        num_classes: int,
+        embed_dim: int = 64,
+        hidden_dim: int = 64,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+        pad_id: int = 0,
+    ):
+        super().__init__()
+        self.pad_id = pad_id
+
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_id)
+        self.lstm = nn.LSTM(
+            input_size=embed_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.batch_norm = nn.BatchNorm1d(hidden_dim)
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, 32),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(32, num_classes),
+        )
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        mask = input_ids.ne(self.pad_id)
+        lengths = mask.sum(dim=1).clamp(min=1).cpu()
+
+        x = self.embedding(input_ids)
+        packed = pack_padded_sequence(
+            x,
+            lengths=lengths,
+            batch_first=True,
+            enforce_sorted=False,
+        )
+        _, (h_n, _) = self.lstm(packed)
+        features = h_n[-1]
+
+        if self.training and features.size(0) == 1:
+            normed = features
+        else:
+            normed = self.batch_norm(features)
+
+        return self.head(normed)
 
 
 class SequenceDataset(Dataset):
@@ -90,6 +151,54 @@ class SequenceDataset(Dataset):
         }
 
 
+def build_model(
+    vocab_size: int,
+    num_classes: int,
+    pad_id: int,
+    cfg: TrainConfig,
+) -> nn.Module:
+    if cfg.model_type == "transformer":
+        return TransformerClassifier(
+            vocab_size=vocab_size,
+            num_classes=num_classes,
+            max_len=cfg.max_program_len,
+            d_model=cfg.d_model,
+            nhead=cfg.nhead,
+            num_layers=cfg.num_layers,
+            dim_feedforward=cfg.dim_feedforward,
+            dropout=cfg.dropout,
+            pad_id=pad_id,
+        )
+    if cfg.model_type == "lstm":
+        return DeepTuneLSTMClassifier(
+            vocab_size=vocab_size,
+            num_classes=num_classes,
+            embed_dim=cfg.d_model,
+            hidden_dim=cfg.d_model,
+            num_layers=cfg.num_layers,
+            dropout=cfg.dropout,
+            pad_id=pad_id,
+        )
+    raise ValueError(f"Unsupported model_type: {cfg.model_type}")
+
+
+def _build_loss(
+    train_labels: Sequence[int],
+    num_classes: int,
+    cfg: TrainConfig,
+    use_class_weights: bool,
+) -> nn.Module:
+    if not use_class_weights:
+        return nn.CrossEntropyLoss()
+
+    counts = np.bincount(np.asarray(train_labels, dtype=np.int64), minlength=num_classes)
+    counts = np.maximum(counts, 1)
+    weights = counts.sum() / counts
+    weights = weights / weights.mean()
+    weight_tensor = torch.tensor(weights, dtype=torch.float32, device=cfg.device)
+    return nn.CrossEntropyLoss(weight=weight_tensor)
+
+
 def train_one_model(
     train_sequences,
     train_labels,
@@ -99,17 +208,13 @@ def train_one_model(
     num_classes,
     pad_id,
     cfg,
+    use_class_weights: bool = False,
 ):
-    model = TransformerClassifier(
+    model = build_model(
         vocab_size=vocab_size,
         num_classes=num_classes,
-        max_len=cfg.max_program_len,
-        d_model=cfg.d_model,
-        nhead=cfg.nhead,
-        num_layers=cfg.num_layers,
-        dim_feedforward=cfg.dim_feedforward,
-        dropout=cfg.dropout,
         pad_id=pad_id,
+        cfg=cfg,
     ).to(cfg.device)
 
     train_loader = DataLoader(
@@ -128,10 +233,10 @@ def train_one_model(
         lr=cfg.lr,
         weight_decay=cfg.weight_decay,
     )
-    criterion = nn.CrossEntropyLoss()
+    criterion = _build_loss(train_labels, num_classes, cfg, use_class_weights)
 
     best_state = None
-    best_acc = -1.0
+    best_score = (-1.0, float("-inf"))
 
     epoch_bar = tqdm(range(cfg.epochs), desc="Training epochs", leave=True)
 
@@ -153,6 +258,7 @@ def train_one_model(
             logits = model(input_ids)
             loss = criterion(logits, labels)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             running_loss += loss.item()
@@ -193,12 +299,13 @@ def train_one_model(
             train_loss=f"{avg_train_loss:.4f}",
             val_loss=f"{avg_val_loss:.4f}",
             val_acc=f"{val_acc:.4f}",
-            best=f"{max(best_acc, val_acc):.4f}",
+            best=f"{max(best_score[0], val_acc):.4f}",
         )
 
-        if val_acc >= best_acc:
-            best_acc = val_acc
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        score = (val_acc, -avg_val_loss)
+        if score >= best_score:
+            best_score = score
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -206,7 +313,7 @@ def train_one_model(
     return model
 
 
-def predict(model: TransformerClassifier, sequences: Sequence[Sequence[int]], cfg: TrainConfig) -> np.ndarray:
+def predict(model: nn.Module, sequences: Sequence[Sequence[int]], cfg: TrainConfig) -> np.ndarray:
     loader = DataLoader(SequenceDataset(sequences, [0] * len(sequences)), batch_size=cfg.batch_size, shuffle=False)
     preds = []
     model.eval()

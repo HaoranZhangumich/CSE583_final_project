@@ -5,10 +5,12 @@ import re
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Dict, List
 
 from tqdm import tqdm
 
 from config import collect_all_unique_sources, ensure_dir, read_text, sha1_text, write_json, write_text
+
 
 def default_clang_commands() -> List[List[str]]:
     return [
@@ -46,8 +48,34 @@ def default_clang_commands() -> List[List[str]]:
     ]
 
 
+def extract_function_bodies(ir_text: str) -> str:
+    kept: List[str] = []
+    inside = False
+    brace_depth = 0
+
+    for raw_line in ir_text.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        if stripped.startswith("define "):
+            inside = True
+            brace_depth = stripped.count("{") - stripped.count("}")
+            kept.append(line)
+            continue
+
+        if inside:
+            kept.append(line)
+            brace_depth += stripped.count("{") - stripped.count("}")
+            if brace_depth <= 0:
+                inside = False
+
+    return "\n".join(kept).strip()
+
+
 def normalize_llvm_ir(ir_text: str) -> str:
-    lines = []
+    lines: List[str] = []
     for line in ir_text.splitlines():
         stripped = line.strip()
         if not stripped:
@@ -58,12 +86,18 @@ def normalize_llvm_ir(ir_text: str) -> str:
             continue
         if stripped.startswith("source_filename ="):
             continue
+        if stripped.startswith("attributes #"):
+            continue
+        if stripped.startswith("declare "):
+            continue
         stripped = re.sub(r",?\s*!dbg\s*!\d+", "", stripped)
         stripped = re.sub(r",?\s*!tbaa\s*!\d+", "", stripped)
         stripped = re.sub(r",?\s*!range\s*!\d+", "", stripped)
         stripped = re.sub(r",?\s*!llvm\.loop\s*!\d+", "", stripped)
+        stripped = re.sub(r"#[0-9]+", "", stripped)
         stripped = re.sub(r"\s+", " ", stripped).strip()
-        lines.append(stripped)
+        if stripped:
+            lines.append(stripped)
     return "\n".join(lines)
 
 
@@ -86,7 +120,14 @@ def compile_opencl_to_llvm_ir(src_code: str, clang_bin: str = "clang") -> str:
                 ) from exc
 
             if proc.returncode == 0 and out_path.exists():
-                return normalize_llvm_ir(read_text(out_path))
+                raw_ir = read_text(out_path)
+                body_ir = extract_function_bodies(raw_ir)
+                ir_to_use = body_ir if body_ir else raw_ir
+                normalized = normalize_llvm_ir(ir_to_use)
+                if normalized:
+                    return normalized
+                return normalize_llvm_ir(raw_ir)
+
             errors.append(
                 f"Command failed: {' '.join(cmd)}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
             )

@@ -20,17 +20,23 @@ CLASS_TO_CF = {i: cf for i, cf in enumerate(COARSENING_FACTORS)}
 
 @dataclasses.dataclass
 class TrainConfig:
+    input_mode: str = "ir"          # "ir" or "source"
+    model_type: str = "transformer" # "transformer" or "lstm"
+
     epochs: int = 30
     batch_size: int = 16
     lr: float = 1e-3
     weight_decay: float = 1e-4
-    d_model: int = 128
+
+    d_model: int = 64
     nhead: int = 8
-    num_layers: int = 4
+    num_layers: int = 2
     dim_feedforward: int = 256
     dropout: float = 0.1
+
     max_program_len: int = 1024
     max_stmt_len: int = 64
+
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 

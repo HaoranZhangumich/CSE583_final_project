@@ -11,21 +11,32 @@ from tokenizers.pre_tokenizers import Whitespace
 from tokenizers.processors import TemplateProcessing
 from tokenizers.trainers import WordPieceTrainer
 
-from config import SPECIAL_TOKENS, ensure_dir, read_text
+from config import SPECIAL_TOKENS, collect_all_unique_sources, ensure_dir, read_text
 
 
-def iter_ir_statements_from_cache(cache_dir: Path) -> Iterable[str]:
-    for path in sorted(cache_dir.glob("*.ll")):
-        ir_text = read_text(path)
-        for line in ir_text.splitlines():
-            stmt = line.strip()
-            if stmt:
-                yield stmt
+def iter_text_statements(repo_root: Path, cache_dir: Path, input_mode: str) -> Iterable[str]:
+    if input_mode == "ir":
+        for path in sorted(cache_dir.glob("*.ll")):
+            ir_text = read_text(path)
+            for line in ir_text.splitlines():
+                stmt = line.strip()
+                if stmt:
+                    yield stmt
+    elif input_mode == "source":
+        for src in collect_all_unique_sources(repo_root):
+            for line in str(src).splitlines():
+                stmt = line.strip()
+                if stmt:
+                    yield stmt
+    else:
+        raise ValueError(f"Unsupported input_mode: {input_mode}")
 
 
 def train_wordpiece_tokenizer(
+    repo_root: Path,
     cache_dir: Path,
     tokenizer_path: Path,
+    input_mode: str,
     vocab_size: int = 8000,
     min_frequency: int = 2,
 ) -> Path:
@@ -38,7 +49,10 @@ def train_wordpiece_tokenizer(
         min_frequency=min_frequency,
         special_tokens=SPECIAL_TOKENS,
     )
-    tokenizer.train_from_iterator(iter_ir_statements_from_cache(cache_dir), trainer=trainer)
+    tokenizer.train_from_iterator(
+        iter_text_statements(repo_root, cache_dir, input_mode),
+        trainer=trainer,
+    )
 
     cls_id = tokenizer.token_to_id("[CLS]")
     sep_id = tokenizer.token_to_id("[SEP]")
@@ -57,9 +71,9 @@ def load_tokenizer(tokenizer_path: Path) -> Tokenizer:
     return Tokenizer.from_file(str(tokenizer_path))
 
 
-def encode_program_ir(
+def encode_program_text(
     tokenizer: Tokenizer,
-    ir_text: str,
+    text: str,
     max_stmt_len: int = 64,
     max_program_len: int = 1024,
 ) -> List[int]:
@@ -70,7 +84,7 @@ def encode_program_ir(
         raise ValueError("Tokenizer is missing required special tokens.")
 
     tokens: List[int] = [cls_id]
-    for stmt in ir_text.splitlines():
+    for stmt in str(text).splitlines():
         stmt = stmt.strip()
         if not stmt:
             continue
