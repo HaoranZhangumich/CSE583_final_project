@@ -122,9 +122,8 @@ def compile_opencl_to_llvm_ir(src_code: str, clang_bin: str = "clang") -> str:
             if proc.returncode == 0 and out_path.exists():
                 raw_ir = read_text(out_path)
                 # to keep more information for IR
-                # body_ir = extract_function_bodies(raw_ir)
-                # ir_to_use = body_ir if body_ir else raw_ir
-                # normalized = normalize_llvm_ir(ir_to_use)
+                body_ir = extract_function_bodies(raw_ir)
+                ir_to_use = body_ir if body_ir else raw_ir
                 normalized = normalize_llvm_ir(raw_ir)
                 if normalized:
                     return normalized
